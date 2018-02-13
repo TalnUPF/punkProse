@@ -2,404 +2,333 @@
 from __future__ import division
 from optparse import OptionParser
 from collections import OrderedDict
+import sys
+import os
+import numpy as np
 from time import time
+import yaml
 
 import models
+from models import PuncTensor
+from utilities import *
 
 import theano
-import sys
-import os.path
-
-import cPickle
 import theano.tensor as T
-import numpy as np
+from theano.compile.io import In
 
 MAX_EPOCHS = 50
-MINIBATCH_SIZE = 128
 L2_REG = 0.0
 CLIPPING_THRESHOLD = 2.0
 PATIENCE_EPOCHS = 1
-MAX_SEQUENCE_LEN = 50
 
-def get_minibatch_opExtra(file_name, batch_size, sequence_length, semitone_feature_names, shuffle, reduced_punctuation):
+def get_minibatch(sample_directory, vocabulary_dict, leveler_dict, batch_size, sequence_length, shuffle=False, input_feature_names = [], reduced_punctuation=True, output_label="punctuation_before"):
+	sample_file_list = os.listdir(sample_directory)
 
-    with open(file_name, 'rb') as f:
-        dataset = cPickle.load(f)
-        #print(subsequence.keys())  
+	if shuffle:
+		np.random.shuffle(sample_file_list)
 
-    if shuffle:
-        np.random.shuffle(dataset)
+	input_batches = {feature_name:[] for feature_name in input_feature_names}
+	output_batch = []
 
-    X_batch = []
-    Y_batch = []
-    P_batch = []
-    otherBatches = [[] for feature_name in semitone_feature_names]
+	if len(sample_file_list) < batch_size:
+		print("WARNING: Not enough samples in '%s'. Reduce mini-batch size to %d or use a dataset with at least %d words."%(
+			file_name,
+	        len(sample_file_list),
+	        batch_size * sequence_length))
 
-    if len(dataset) < batch_size:
-        print("WARNING: Not enough samples in '%s'. Reduce mini-batch size to %d or use a dataset with at least %d words."%(
-            file_name,
-            len(dataset),
-            MINIBATCH_SIZE * sequence_length))
+	for sample_filename in sample_file_list:
+		proscript_file = os.path.join(sample_directory, sample_filename)
+		try:
+			proscript = read_proscript(proscript_file)
+		except:
+			print("Couldn't read %s"%proscript_file)
+			continue
 
-    for subsequence in dataset:   
+		input_sample_layers = {}
 
-        X_batch.append(subsequence['word.id'])
-        if reduced_punctuation:
-            Y_batch.append(subsequence['punc.red.id'][1:sequence_length])
-        else:
-            Y_batch.append(subsequence['punc.id'][1:sequence_length])
-        P_batch.append(subsequence['pause.id']) 
+		for feature_name in input_feature_names:
+			if feature_name in vocabulary_dict.keys():
+				vocabulary = vocabulary_dict[feature_name]
+				sample_layer = [vocabulary.get(w, vocabulary[UNK]) for w in proscript[feature_name]]
+			elif feature_name in leveler_dict.keys():
+				get_level_func = leveler_dict[feature_name]
+				sample_layer = [get_level_func(v) for v in proscript[feature_name]]
+				#print(proscript[feature_name])
+			else:
+				sample_layer = proscript[feature_name]
 
-        for index, feature_name in enumerate(semitone_feature_names): 
-            otherBatches[index].append(subsequence[feature_name]) 
+			input_length = len(sample_layer)
+			input_sample_layers[feature_name] = sample_layer
 
-        if len(X_batch) == batch_size:
-            # Transpose, because the model assumes the first axis is time
-            X = np.array(X_batch, dtype=np.int32).T
-            Y = np.array(Y_batch, dtype=np.int32).T
-            P = np.array(P_batch, dtype=np.int32).T
-            otherTensors = [np.array(batch, dtype=np.int32).T for batch in otherBatches]
-            
-            yield X, Y, P, otherTensors
-            
-            X_batch = []
-            Y_batch = []
-            P_batch = []
-            otherBatches = [[] for feature_name in semitone_feature_names]
+		if reduced_punctuation:
+			output_sample_layer = [reducePuncCode(INV_PUNCTUATION_CODES[punc]) for punc in proscript[output_label]]
+		else:
+			output_sample_layer = [INV_PUNCTUATION_CODES[punc] for punc in proscript[output_label]]
 
-def checkArgument(argname, isFile=False, isDir=False):
-    if not argname:
-        return False
-    else:
-        if isFile and not os.path.isfile(argname):
-            return False
-        if isDir and not os.path.isdir(argname):
-            return False
-    return True
+		#need padding for batch processing
+		if batch_size > 1:
+			for feature_name in input_sample_layers.keys():
+				if feature_name in vocabulary_dict.keys():
+					vocabulary = vocabulary_dict[feature_name]
+					input_sample_layers[feature_name] = pad(input_sample_layers[feature_name], sequence_length, vocabulary[EMP])
+				elif feature_name in leveler_dict.keys():
+					get_level_func = leveler_dict[feature_name]
+					input_sample_layers[feature_name] = pad(input_sample_layers[feature_name], sequence_length, get_level_func(0.0))
+				else:
+					input_sample_layers[feature_name] = pad(input_sample_layers[feature_name], sequence_length, 0.0)
+			output_sample_layer = pad(output_sample_layer, sequence_length, INV_PUNCTUATION_CODES[EMPTY])
+			input_length = sequence_length
 
+		# print(input_sample_layers)
+		# print(output_sample_layer)
+		# input("...")
+
+		#add sample to batch
+		for feature_name in input_sample_layers.keys():
+			input_batches[feature_name].append(input_sample_layers[feature_name])
+
+		output_batch.append(output_sample_layer[1:input_length])
+
+		#yield batch if batch size is reached
+		if len(output_batch) == batch_size:
+			input_tensors = {batch_name: np.array(input_batches[batch_name], dtype=np.int32).T for batch_name in input_batches.keys()}
+			output_tensor = np.array(output_batch, dtype=np.int32).T
+
+			yield input_tensors, output_tensor
+
+			input_batches = {feature_name:[] for feature_name in input_feature_names}
+			output_batch = []
+		
 def main(options):
-    if checkArgument(options.model_name):
-        model_name = options.model_name
-    else:
-        sys.exit("'Model name' (-m)missing!")
+	if checkArgument(options.params_filename, isFile=True):
+		with open(options.params_filename, 'r') as ymlfile:
+			config = yaml.load(ymlfile)
+	else:
+		sys.exit("Parameters file missing")
 
-    if checkArgument(options.num_hidden):
-        num_hidden = int(options.num_hidden)
-    else:
-        sys.exit("'Hidden layer size (-h) missing!")
+	if checkArgument(options.model_name):
+		model_name = options.model_name
+	else:
+		sys.exit("'Model name' (-m)missing!")
 
-    if checkArgument(options.num_hidden_params):
-        num_hidden_params = int(options.num_hidden_params)
-    else:
-        sys.exit("Parameters hidden layer size (-o) missing!")
+	num_hidden = int(config["NUM_HIDDEN_OUTPUT"])
+	learning_rate = float(config["LEARNING_RATE"])
+	batch_size = int(config["BATCH_SIZE"])
+	sample_size = int(config["SAMPLE_SIZE"])
+	output_label = config["OUTPUT_LABEL"]
+	data_dir = config["DATA_DIR"]
+	input_feature_names = options.input_features
+	vocabulary_dict = {}
+	leveler_dict = {}
+	no_of_levels_dict = {}
 
-    if checkArgument(options.learning_rate):
-        learning_rate = float(options.learning_rate)
-    else:
-        sys.exit("'Learning rate' (-l) missing!")
+	if checkArgument(data_dir, isDir=True):
+		TRAINING_SAMPLES_DIR = os.path.join(data_dir, "train_samples")
+		if not checkArgument(TRAINING_SAMPLES_DIR, isDir=True):
+			sys.exit("TRAINING dir missing!")
+		DEV_SAMPLES_DIR = os.path.join(data_dir, "dev_samples")
+		if not checkArgument(DEV_SAMPLES_DIR, isDir=True):
+			sys.exit("DEV dir missing!")
+	else:
+		sys.exit("Data directory missing")
 
-    if checkArgument(options.data_dir, isDir=True):
-        data_dir = options.data_dir
-        TRAIN_FILE = os.path.join(data_dir, "train.pickle")
-        if not checkArgument(TRAIN_FILE, isFile=True):
-            sys.exit("TRAIN file missing!")
-        DEV_FILE = os.path.join(data_dir, "dev.pickle")
-        if not checkArgument(DEV_FILE, isFile=True):
-            sys.exit("DEV file missing!")
-        TEST_FILE = os.path.join(data_dir, "test.pickle")
-        if not checkArgument(TEST_FILE, isFile=True):
-            sys.exit("TEST file missing!")
-        WORD_VOCAB_FILE = os.path.join(data_dir, "vocabulary.pickle")
-        if not checkArgument(WORD_VOCAB_FILE, isFile=True):
-            sys.exit("WORD_VOCAB file missing!")
-        METADATA_FILE = os.path.join(data_dir, "metadata.pickle")
-        if not checkArgument(METADATA_FILE, isFile=True):
-            sys.exit("METADATA file missing!")
-    else:
-        sys.exit("Data directory missing")
+	if options.build_on_stage_1:
+		stage1_model_file_name = options.build_on_stage_1
+		model_file_name = "Model_stage-2_%s.pcl"%(model_name)
+	else:
+		model_file_name = "Model_single-stage_%s.pcl"%(model_name)
 
-    model_file_name = "Model_single-stage_%s_h%d_lr%s.pcl" % (model_name, num_hidden, learning_rate)
+	#check if model with name already exists
+	if checkArgument(model_file_name, isFile=True):
+		answer = input("Model with same name exists. Overwrite? (y/n)")
+		if not answer.lower() == "y":
+			sys.exit("Change model name.")
 
-    print("num_hidden:%i, learning rate:%.2f, model filename:%s"%(num_hidden, learning_rate, model_file_name))
+	print("model filename:%s"%model_file_name)
+	print("num_hidden:%i, learning rate:%.2f"%(num_hidden, learning_rate))
+	print("batch_size:%i, sample padding length:%i"%(batch_size, sample_size))
 
-    #Read corpus metadata
-    with open(METADATA_FILE, 'rb') as f:
-        metadata = cPickle.load(f)
+	for feature_name in input_feature_names:
+		#Load vocabularies of vocabularized features
+		if feature_name in config["FEATURE_VOCABULARIES"].keys():
+			VOCAB_FILE = os.path.join(data_dir, config["FEATURE_VOCABULARIES"][feature_name])
+			if not checkArgument(VOCAB_FILE, isFile=True):
+				sys.exit("%s vocabulary file missing!"%feature_name)
+			vocabulary = read_vocabulary(VOCAB_FILE)
+			vocabulary_dict[feature_name] = vocabulary
+			print("%s vocabulary file: %s"%(feature_name, VOCAB_FILE))
+		#Load bins of leveled features
+		if config["LEVELED_FEATURES"]:
+			if feature_name in config["LEVELED_FEATURES"].keys():
+				LEVELS_FILE = os.path.join(data_dir, config["LEVELED_FEATURES"][feature_name])
+				if not checkArgument(LEVELS_FILE, isFile=True):
+					sys.exit("%s levels file missing!"%feature_name)
+				get_level_func, no_of_levels = get_level_maker(LEVELS_FILE)
+				leveler_dict[feature_name] = get_level_func
+				no_of_levels_dict[feature_name] = no_of_levels
 
-    x_vocabulary_size = metadata['word_vocab_size']
-    print("Word vocabulary size:%i"%x_vocabulary_size)
-    if options.reduced_punctuation:
-        y_vocabulary_size = metadata['punc_red_vocab_size']
-        print("Using reduced punctuation set. (Size:%i)"%y_vocabulary_size)
-    else:
-        y_vocabulary_size = metadata['punc_vocab_size']
-        print("Using full punctuation set. (Size:%i)"%y_vocabulary_size)
-    
-    num_pause = metadata['no_of_pause_levels'] + 1
-    print("Number of pause levels with 0: %i)"%num_pause)
-    num_semitone = metadata['no_of_semitone_levels'] + 1
-    print("Number of semitone levels with 0: %i)"%num_semitone)
+	if options.reduced_punctuation:
+		y_vocabulary_size = len(REDUCED_PUNCTUATION_VOCABULARY)
+		print("Using reduced punctuation set. (Size:%i)"%y_vocabulary_size)
+	else:
+		y_vocabulary_size = len(PUNCTUATION_VOCABULARY)
+		print("Using full punctuation set. (Size:%i)"%y_vocabulary_size)
 
-    data_sequence_length = metadata['sequence_length']
+	#prepare the tensors
+	lr = T.scalar('lr')
+	y = T.imatrix('y')
 
-    x = T.imatrix('x')
-    y = T.imatrix('y')
-    lr = T.scalar('lr')
-    p = None
-    a = None
-    b = None
-    c = None
+	#build model
+	rng = np.random
+	rng.seed(1)
+	input_PuncTensors = []
+	if options.build_on_stage_1:
+		p = T.matrix('pause_before')
+		stage1_net, stage1_inputs, stage1_input_feature_names, _ = models.load(stage1_model_file_name, batch_size)
+		x = stage1_inputs[0]
 
-    if options.train_with_pause:
-        print("Training with pause (Num of levels: %i)"%num_pause)
-        p = T.imatrix('p')
-    else:
-        num_semitone_features = -1
+		vocabulary_size = len(vocabulary_dict["word"])
+		x_PuncTensor = PuncTensor(name="word", tensor=x, size_hidden=config["FEATURE_NUM_HIDDEN"]["word"], size_emb=config["FEATURE_EMB_SIZE"]["word"], vocabularized=True, vocabulary_size=vocabulary_size, bidirectional=True)
+		p_PuncTensor = PuncTensor(name="pause_before", tensor=p, size_hidden=config["FEATURE_NUM_HIDDEN"]["pause_before"], size_emb=1, vocabularized=False, bidirectional=False)
+		input_PuncTensors.append(x_PuncTensor)
+		input_PuncTensors.append(p_PuncTensor)
+		net = models.GRU_stage2(rng=rng,
+								y_vocabulary_size=y_vocabulary_size, 
+							  	minibatch_size=batch_size, 
+							  	num_hidden_output = num_hidden,
+							  	x_PuncTensor=x_PuncTensor,
+							  	p_PuncTensor=p_PuncTensor, 
+							  	stage1_net=stage1_net,
+							  	stage1_inputs=stage1_inputs,
+							  	stage1_input_feature_names=stage1_input_feature_names)
+	else:
+		for feature_name in input_feature_names:
+			stats = "Training with %s"%feature_name
+			if feature_name in config["BIDIRECTIONAL_FEATURES"]:
+				is_bidi = True
+				stats += " (bidirectional)"
+			else:
+				is_bidi = False
 
-    semitone_feature_names = options.semitone_features
-    num_semitone_features = len(options.semitone_features)
+			if feature_name in vocabulary_dict.keys():
+				vocabulary = vocabulary_dict[feature_name]
+				stats += " (vocabulary size: %i)"%len(vocabulary)
+				stats += " (embedded size: %i)"%config["FEATURE_EMB_SIZE"][feature_name]
+				tensor = T.imatrix(feature_name)
+				vocabulary_size = len(vocabulary_dict[feature_name])
+				feature_PuncTensor = PuncTensor(name=feature_name, tensor=tensor, size_hidden=config["FEATURE_NUM_HIDDEN"][feature_name], size_emb=config["FEATURE_EMB_SIZE"][feature_name], vocabularized=True, vocabulary_size=vocabulary_size, bidirectional=is_bidi)
+			elif feature_name in leveler_dict.keys():
+				#get_level_func = leveler_dict[feature_name]
+				no_of_levels = no_of_levels_dict[feature_name]
+				stats += " (%i levels)"%no_of_levels
+				tensor = T.imatrix(feature_name)
+				feature_PuncTensor = PuncTensor(name=feature_name, tensor=tensor, size_hidden=config["FEATURE_NUM_HIDDEN"][feature_name], size_emb=config["FEATURE_EMB_SIZE"][feature_name], vocabularized=True, vocabulary_size=no_of_levels, bidirectional=is_bidi)
+			else:
+				#continous values
+				stats += " (continous)"
+				tensor = T.matrix(feature_name)
+				feature_PuncTensor = PuncTensor(name=feature_name, tensor=tensor, size_hidden=config["FEATURE_NUM_HIDDEN"][feature_name], size_emb=1, vocabularized=False, bidirectional=is_bidi)
+			input_PuncTensors.append(feature_PuncTensor)
+			print(stats)
 
-    print("Semitone features:")
-    print(semitone_feature_names)
+		net = models.GRU_parallel(rng=rng, 
+								  y_vocabulary_size=y_vocabulary_size, 
+								  minibatch_size=batch_size, 
+								  num_hidden_output = num_hidden,
+								  input_tensors=input_PuncTensors)
 
-    if num_semitone_features == 1: 
-        print("Training with %s (Num of levels: %i)"%(options.semitone_features[0], num_semitone))
-        a = T.imatrix('a')
-    elif num_semitone_features == 2:
-        print("Training with %s (Num of levels: %i)"%(options.semitone_features[0], num_semitone))
-        a = T.imatrix('a')
-        print("Training with %s (Num of levels: %i)"%(options.semitone_features[1], num_semitone))
-        b = T.imatrix('b')
-    elif num_semitone_features == 3: 
-        print("Training with %s (Num of levels: %i)"%(options.semitone_features[0], num_semitone))
-        a = T.imatrix('a')
-        print("Training with %s (Num of levels: %i)"%(options.semitone_features[1], num_semitone))
-        b = T.imatrix('b')
-        print("Training with %s (Num of levels: %i)"%(options.semitone_features[2], num_semitone))
-        c = T.imatrix('c')
-    elif num_semitone_features > 3:
-        sys.exit("Too many extra features (for now)")
+	starting_epoch = 0
+	best_ppl = np.inf
+	validation_ppl_history = []
 
-    continue_with_previous = False
-    if os.path.isfile(model_file_name):
-        while True:
-            resp = raw_input("Found an existing model with the name %s. Do you want to:\n[c]ontinue training the existing model?\n[r]eplace the existing model and train a new one?\n[e]xit?\n>" % model_file_name)
-            resp = resp.lower().strip()
-            if resp not in ('c', 'r', 'e'):
-                continue
-            if resp == 'e':
-                sys.exit()
-            elif resp == 'c':
-                continue_with_previous = True
-            break
+	gsums = [theano.shared(np.zeros_like(param.get_value(borrow=True))) for param in net.params]
 
-    if continue_with_previous:
-        print "Loading previous model state" 
+	#assign inputs
+	training_inputs = [i.tensor for i in input_PuncTensors] + [y, lr]
+	validation_inputs = [i.tensor for i in input_PuncTensors] + [y]
 
-        net, state = models.load(model_file_name, MINIBATCH_SIZE, x=x, p=p, feature_a=a, feature_b=b, feature_c=c, num_semitone_features=num_semitone_features)
+	#determine cost function
+	cost = net.cost(y) + L2_REG * net.L2_sqr
 
-        gsums, learning_rate, validation_ppl_history, starting_epoch, rng = state
-        best_ppl = min(validation_ppl_history)
-    else:
-        rng = np.random
-        rng.seed(1)
+	gparams = T.grad(cost, net.params)
+	updates = OrderedDict()
 
-        if not options.train_with_pause:
-            print("Building model: GRU_single_concat_early_noPause")
-            net = models.GRU_single_concat_early_noPause(
-                rng=rng,
-                x=x,
-                minibatch_size=MINIBATCH_SIZE,
-                n_hidden=num_hidden,
-                x_vocabulary_size=x_vocabulary_size,
-                y_vocabulary_size=y_vocabulary_size,
-                no_pause_levels=num_pause,
-                no_semitone_levels=num_semitone,
-            )
-        elif options.train_with_pause and num_semitone_features == 0:
-            print("Building model: GRU_single_concat_early")
-            net = models.GRU_single_concat_early(
-                rng=rng,
-                x=x,
-                minibatch_size=MINIBATCH_SIZE,
-                n_hidden=num_hidden,
-                n_hidden_params=num_hidden_params,
-                x_vocabulary_size=x_vocabulary_size,
-                y_vocabulary_size=y_vocabulary_size,
-                no_pause_levels=num_pause,
-                no_semitone_levels=num_semitone,
-                p=p 
-            )
-        elif options.train_with_pause and num_semitone_features == 1:
-            print("Building model: GRU_single_concat_early_plus")
-            net = models.GRU_single_concat_early_plus(
-                rng=rng,
-                x=x,
-                minibatch_size=MINIBATCH_SIZE,
-                n_hidden=num_hidden,
-                n_hidden_params=num_hidden_params,
-                x_vocabulary_size=x_vocabulary_size,
-                y_vocabulary_size=y_vocabulary_size,
-                no_pause_levels=num_pause,
-                no_semitone_levels=num_semitone,
-                p=p,
-                feature_a=a   
-            )
-        elif options.train_with_pause and num_semitone_features == 2:
-            print("Building model: GRU_single_concat_early_plus_plus")
-            net = models.GRU_single_concat_early_plus_plus(
-                rng=rng,
-                x=x,
-                minibatch_size=MINIBATCH_SIZE,
-                n_hidden=num_hidden,
-                n_hidden_params=num_hidden_params,
-                x_vocabulary_size=x_vocabulary_size,
-                y_vocabulary_size=y_vocabulary_size,
-                no_pause_levels=num_pause,
-                no_semitone_levels=num_semitone,
-                p=p,
-                feature_a=a,
-                feature_b=b
-            )
-        elif options.train_with_pause and num_semitone_features == 3:
-            print("Building model: GRU_single_concat_early_plus_plus_plus")
-            net = models.GRU_single_concat_early_plus_plus_plus(
-                rng=rng,
-                x=x,
-                minibatch_size=MINIBATCH_SIZE,
-                n_hidden=num_hidden,
-                n_hidden_params=num_hidden_params,
-                x_vocabulary_size=x_vocabulary_size,
-                y_vocabulary_size=y_vocabulary_size,
-                no_pause_levels=num_pause,
-                no_semitone_levels=num_semitone,
-                p=p,
-                feature_a=a,
-                feature_b=b,
-                feature_c=c
-            )
-        else:
-            sys.exit("Check pause levels (-p) or semitone levels (-s) parameters")
+	# Compute norm of gradients
+	norm = T.sqrt(T.sum([T.sum(gparam ** 2) for gparam in gparams]))
 
-        starting_epoch = 0
-        best_ppl = np.inf
-        validation_ppl_history = []
+	# Adagrad: "Adaptive subgradient methods for online learning and stochastic optimization" (2011)
+	for gparam, param, gsum in zip(gparams, net.params, gsums):
+		gparam = T.switch(
+			T.ge(norm, CLIPPING_THRESHOLD),
+	        gparam / norm * CLIPPING_THRESHOLD,
+	        gparam
+	    ) # Clipping of gradients
+		updates[gsum] = gsum + (gparam ** 2)
+		updates[param] = param - lr * (gparam / (T.sqrt(updates[gsum] + 1e-6)))
 
-        gsums = [theano.shared(np.zeros_like(param.get_value(borrow=True))) for param in net.params]
+	train_model = theano.function(
+		inputs=training_inputs,
+		outputs=cost,
+		updates=updates,
+		on_unused_input='warn'
+	)
 
-    #assign inputs
+	validate_model = theano.function(
+	    inputs=validation_inputs,
+	    outputs=net.cost(y),
+	    on_unused_input='warn'
+	)
 
-    training_inputs = [x] + [i for i in [p,a,b,c] if not i == None] + [y, lr]
-    validation_inputs = [x] + [i for i in [p,a,b,c] if not i == None] + [y]
+	print("Training...")
+	for epoch in range(starting_epoch, MAX_EPOCHS):
+		t0 = time()
+		total_neg_log_likelihood = 0
+		total_num_output_samples = 0
+		iteration = 0 
+		for INPUT_BATCHES, OUTPUT_BATCH in get_minibatch(TRAINING_SAMPLES_DIR, vocabulary_dict, leveler_dict, batch_size, sample_size, shuffle=True, input_feature_names=input_feature_names, reduced_punctuation=options.reduced_punctuation, output_label="punctuation_before"):
+			train_arguments = [INPUT_BATCHES[puncTensor.name] for puncTensor in input_PuncTensors] + [OUTPUT_BATCH, learning_rate]
+			total_neg_log_likelihood += train_model(*train_arguments)
+			total_num_output_samples += np.prod(OUTPUT_BATCH.shape)
+			iteration += 1
+			if iteration % 100 == 0:
+				sys.stdout.write("PPL: %.4f; Speed: %.2f sps\n" % (np.exp(total_neg_log_likelihood / total_num_output_samples), total_num_output_samples / max(time() - t0, 1e-100)))
+				sys.stdout.flush()
+		print("Total number of training labels: %d" % total_num_output_samples)
 
-    #determine cost function
-    cost = net.cost(y) + L2_REG * net.L2_sqr
+		total_neg_log_likelihood = 0
+		total_num_output_samples = 0
 
-    gparams = T.grad(cost, net.params)
-    updates = OrderedDict()
+		for INPUT_BATCHES, OUTPUT_BATCH in get_minibatch(DEV_SAMPLES_DIR, vocabulary_dict, leveler_dict, batch_size, sample_size, shuffle=False, input_feature_names=input_feature_names, reduced_punctuation=options.reduced_punctuation, output_label="punctuation_before"):
+			validate_arguments = [INPUT_BATCHES[puncTensor.name] for puncTensor in input_PuncTensors] + [OUTPUT_BATCH]
+			total_neg_log_likelihood += validate_model(*validate_arguments)
+			total_num_output_samples += np.prod(OUTPUT_BATCH.shape)
 
-    # Compute norm of gradients
-    norm = T.sqrt(T.sum(
-               [T.sum(gparam ** 2) for gparam in gparams]
-           ))
+		print("Total number of validation labels: %d" % total_num_output_samples)
 
-    # Adagrad: "Adaptive subgradient methods for online learning and stochastic optimization" (2011)
-    for gparam, param, gsum in zip(gparams, net.params, gsums):
-        gparam = T.switch(
-            T.ge(norm, CLIPPING_THRESHOLD),
-            gparam / norm * CLIPPING_THRESHOLD,
-            gparam
-        ) # Clipping of gradients
-        updates[gsum] = gsum + (gparam ** 2)
-        updates[param] = param - lr * (gparam / (T.sqrt(updates[gsum] + 1e-6)))
+		ppl = np.exp(total_neg_log_likelihood / total_num_output_samples)
+		validation_ppl_history.append(ppl)
 
-    train_model = theano.function(
-        inputs=training_inputs,
-        outputs=cost,
-        updates=updates,
-        on_unused_input='warn'
-    )
+		print("Validation perplexity is %s"%np.round(ppl, 4))
 
-    validate_model = theano.function(
-        inputs=validation_inputs,
-        outputs=net.cost(y),
-        on_unused_input='warn'
-    )
-
-    print("Training...")
-    for epoch in range(starting_epoch, MAX_EPOCHS):
-        t0 = time()
-        total_neg_log_likelihood = 0
-        total_num_output_samples = 0
-        iteration = 0 
-        for X, Y, P, EXTRA_FEATURE_TENSORS in get_minibatch_opExtra(TRAIN_FILE, MINIBATCH_SIZE, data_sequence_length, semitone_feature_names, shuffle=True, reduced_punctuation=options.reduced_punctuation):   #shuffle=True
-            if num_pause == 0:
-                total_neg_log_likelihood += train_model(X, Y, learning_rate)
-            elif num_semitone_features == 0:
-                total_neg_log_likelihood += train_model(X, P, Y, learning_rate)
-            elif num_semitone_features == 1:
-                total_neg_log_likelihood += train_model(X, P, EXTRA_FEATURE_TENSORS[0], Y, learning_rate)
-            elif num_semitone_features == 2:
-                total_neg_log_likelihood += train_model(X, P, EXTRA_FEATURE_TENSORS[0], EXTRA_FEATURE_TENSORS[1], Y, learning_rate)
-            elif num_semitone_features == 3:
-                total_neg_log_likelihood += train_model(X, P, EXTRA_FEATURE_TENSORS[0], EXTRA_FEATURE_TENSORS[1], EXTRA_FEATURE_TENSORS[2], Y, learning_rate)
-            
-            #total_neg_log_likelihood += train_model(X, inter_P['pause'], Y, learning_rate)
-            total_num_output_samples += np.prod(Y.shape)
-            iteration += 1
-            if iteration % 100 == 0:
-                sys.stdout.write("PPL: %.4f; Speed: %.2f sps\n" % (np.exp(total_neg_log_likelihood / total_num_output_samples), total_num_output_samples / max(time() - t0, 1e-100)))
-                sys.stdout.flush()
-        print("Total number of training labels: %d" % total_num_output_samples)
-
-        total_neg_log_likelihood = 0
-        total_num_output_samples = 0
-        for X, Y, P, EXTRA_FEATURE_TENSORS in get_minibatch_opExtra(DEV_FILE, MINIBATCH_SIZE, data_sequence_length, semitone_feature_names, shuffle=False, reduced_punctuation=options.reduced_punctuation):
-            if num_pause == 0:
-                total_neg_log_likelihood += validate_model(X, Y)
-            elif num_semitone_features == 0:
-                total_neg_log_likelihood += validate_model(X, P, Y)
-            elif num_semitone_features == 1:
-                total_neg_log_likelihood += validate_model(X, P, EXTRA_FEATURE_TENSORS[0], Y)
-            elif num_semitone_features == 2:
-                total_neg_log_likelihood += validate_model(X, P, EXTRA_FEATURE_TENSORS[0], EXTRA_FEATURE_TENSORS[1], Y)
-            elif num_semitone_features == 3:
-                total_neg_log_likelihood += validate_model(X, P, EXTRA_FEATURE_TENSORS[0], EXTRA_FEATURE_TENSORS[1], EXTRA_FEATURE_TENSORS[2], Y)
-            total_num_output_samples += np.prod(Y.shape)
-        print("Total number of validation labels: %d" % total_num_output_samples)
-        
-        ppl = np.exp(total_neg_log_likelihood / total_num_output_samples)
-        validation_ppl_history.append(ppl)
-
-        print("Validation perplexity is %s"%np.round(ppl, 4))
-
-        if ppl <= best_ppl:
-            best_ppl = ppl
-            net.save(model_file_name, gsums=gsums, learning_rate=learning_rate, validation_ppl_history=validation_ppl_history, best_validation_ppl=best_ppl, epoch=epoch, random_state=rng.get_state())
-        elif best_ppl not in validation_ppl_history[-PATIENCE_EPOCHS:]:
-            print("Finished!")
-            print("Best validation perplexity was %s"%best_ppl)
-            break
-
+		if ppl <= best_ppl:
+			best_ppl = ppl
+			net.save(model_file_name, gsums=gsums, learning_rate=learning_rate, validation_ppl_history=validation_ppl_history, best_validation_ppl=best_ppl, epoch=epoch, random_state=rng.get_state())
+		elif best_ppl not in validation_ppl_history[-PATIENCE_EPOCHS:]:
+			print("Finished!")
+			print("Best validation perplexity was %s"%best_ppl)
+			break
 
 if __name__ == "__main__":
-    usage = "usage: %prog [-s infile] [option]"
-    parser = OptionParser(usage=usage)
-    parser.add_option("-m", "--modelname", dest="model_name", default=None, help="output model filename", type="string")
-    parser.add_option("-n", "--hiddensize", dest="num_hidden", default=100, help="hidden layer size", type="string")
-    parser.add_option("-o", "--paramhiddensize", dest="num_hidden_params", default=10, help="params hidden layer size", type="string")
-    parser.add_option("-l", "--learningrate", dest="learning_rate", default=0.05, help="hidden layer size", type="string")
-    parser.add_option("-d", "--datadir", dest="data_dir", default=None, help="Data directory with training/testing/development sets, vocabulary and corpus metadata pickle files", type="string")
-    parser.add_option("-p", "--train_with_pause", dest="train_with_pause", default=False, help="train with pause", action="store_true")
-    #parser.add_option("-s", "--num_semitone_levels", dest="num_semitone_levels", default=-1, help="number of semitone levels in corpus", type="int")
-    parser.add_option("-f", "--semitone_features", dest="semitone_features", default=[], help="semitone features to train with", type="string", action='append')
-    #parser.add_option("-x", "--word_vocab_size", dest="word_vocab_size", default=None, help="Word vocabulary size", type="int")
-    #parser.add_option("-y", "--punc_vocab_size", dest="punc_vocab_size", default=None, help="Punctuation vocabulary size", type="int")
-    parser.add_option("-r", "--reduced_punctuation", dest="reduced_punctuation", default=False, help="Use reduced punctuation vocabulary", action="store_true")
+	usage = "usage: %prog [-s infile] [option]"
+	parser = OptionParser(usage=usage)
+	parser.add_option("-m", "--modelname", dest="model_name", default=None, help="output model filename", type="string")
+	parser.add_option("-d", "--datadir", dest="data_dir", default=None, help="Data directory with training/testing/development sets, vocabulary and corpus metadata pickle files", type="string")
+	parser.add_option("-n", "--hiddensize", dest="num_hidden", default=100, help="hidden layer size", type="string")
+	parser.add_option("-l", "--learningrate", dest="learning_rate", default=0.05, help="hidden layer size", type="string")
+	parser.add_option("-f", "--input_features", dest="input_features", default=[], help="semitone features to train with", type="string", action='append')
+	parser.add_option("-r", "--reduced_punctuation", dest="reduced_punctuation", default=True, help="Use reduced punctuation vocabulary", action="store_true")
+	parser.add_option("-p", "--params_file", dest="params_filename", default=None, help="params filename", type="string")
+	parser.add_option("-t", "--build_on_stage_1", dest="build_on_stage_1", default=None, help="Use two stage approach. Input stage 1 model", type="string")
 
-
-    (options, args) = parser.parse_args()
-    main(options)
-
-
-    
+	(options, args) = parser.parse_args()
+	main(options)

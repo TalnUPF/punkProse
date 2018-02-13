@@ -7,12 +7,13 @@ Computes and prints the overall classification error and precision, recall, F-sc
 from numpy import nan
 import codecs
 import sys
+import os
+from utilities import reducePunc, END, SPACE
+from optparse import OptionParser
 
-SPACE = "_"
+PUNCTUATION_VOCABULARY = {SPACE, ",", ".", "?", "!", "-", ";", ":", "..."}
 
-PUNCTUATION_VOCABULARY = {SPACE, ",", ".", "?", "!", "-", ";", ":"}
-
-def compute_error(target_paths, predicted_paths):
+def compute_error(target_paths, predicted_paths, reduce_punctuation):
     counter = 0
     total_correct = 0
 
@@ -26,46 +27,62 @@ def compute_error(target_paths, predicted_paths):
     false_negatives = {}
 
     for target_path, predicted_path in zip(target_paths, predicted_paths):
+        if not os.path.basename(target_path) == os.path.basename(predicted_path):
+            print("Files don't match. \n %s \n %s"%(target_path, predicted_path))
+            continue
 
-        target_punctuation = " "
-        predicted_punctuation = " "
+        target_punctuation = SPACE
+        predicted_punctuation = SPACE
 
         t_i = 0
         p_i = 0
 
         with codecs.open(target_path, 'r', 'utf-8') as target, codecs.open(predicted_path, 'r', 'utf-8') as predicted:
 
-            target_stream = target.read().split()
-            predicted_stream = predicted.read().split()
+            target_stream = target.read().lower().split() + [END]
+            predicted_stream = predicted.read().lower().split() + [END]
+
+            # print("TARGET")
+            # print(target_stream)
+            # print("PREDICTED")
+            # print(predicted_stream)
             
             while True:
-
+                # print("%s - %s"%(target_stream[t_i], predicted_stream[p_i]))
                 if target_stream[t_i] in PUNCTUATION_VOCABULARY:
                     while target_stream[t_i] in PUNCTUATION_VOCABULARY: # skip multiple consecutive punctuations
                         target_punctuation = target_stream[t_i]
                         target_punctuation = target_punctuation
                         t_i += 1
                 else:
-                    target_punctuation = " "
+                    target_punctuation = SPACE
+                   
 
                 if predicted_stream[p_i] in PUNCTUATION_VOCABULARY:
                     predicted_punctuation = predicted_stream[p_i]
                     p_i += 1
                 else:
-                    predicted_punctuation = " "
+                    predicted_punctuation = SPACE
 
+                if reduce_punctuation:
+                    reduced_punctuation = reducePunc(target_punctuation)
+                    #print("was %s now %s"%(target_punctuation, reduced_punctuation))
+                    target_punctuation = reduced_punctuation
+
+                # print ("target:|%s|\tpredicted:|%s|"%(target_punctuation, predicted_punctuation))                
                 is_correct = target_punctuation == predicted_punctuation
+                # print(is_correct)
 
                 counter += 1 
                 total_correct += is_correct
 
-                if predicted_punctuation == " " and target_punctuation != " ":
+                if predicted_punctuation == SPACE and target_punctuation != SPACE:
                     deletions += 1
-                elif predicted_punctuation != " " and target_punctuation == " ":
+                elif predicted_punctuation != SPACE and target_punctuation == SPACE:
                     insertions += 1
-                elif predicted_punctuation != " " and target_punctuation != " " and predicted_punctuation == target_punctuation:
+                elif predicted_punctuation != SPACE and target_punctuation != SPACE and predicted_punctuation == target_punctuation:
                     correct += 1
-                elif predicted_punctuation != " " and target_punctuation != " " and predicted_punctuation != target_punctuation:
+                elif predicted_punctuation != SPACE and target_punctuation != SPACE and predicted_punctuation != target_punctuation:
                     substitutions += 1
 
                 true_positives[target_punctuation] = true_positives.get(target_punctuation, 0.) + float(is_correct)
@@ -92,8 +109,8 @@ def compute_error(target_paths, predicted_paths):
     overall_fp = 0.0
     overall_fn = 0.0
 
-    print "-"*46
-    print "{:<16} {:<9} {:<9} {:<9}".format('PUNCTUATION','PRECISION','RECALL','F-SCORE')
+    print("-"*46)
+    print("{:<16} {:<9} {:<9} {:<9}".format('PUNCTUATION','PRECISION','RECALL','F-SCORE'))
     for p in PUNCTUATION_VOCABULARY:
 
         if p == SPACE:
@@ -107,27 +124,46 @@ def compute_error(target_paths, predicted_paths):
         precision = (true_positives.get(p,0.) / (true_positives.get(p,0.) + false_positives[p])) if p in false_positives else nan
         recall = (true_positives.get(p,0.) / (true_positives.get(p,0.) + false_negatives[p])) if p in false_negatives else nan
         f_score = (2. * precision * recall / (precision + recall)) if (precision + recall) > 0 else nan        
-        print "{:<16} {:<9} {:<9} {:<9}".format(punctuation, round(precision,3)*100, round(recall,3)*100, round(f_score,3)*100)
-    print "-"*46
+        print("{:<16} {:<9} {:<9} {:<9}".format(punctuation, round(precision,3)*100, round(recall,3)*100, round(f_score,3)*100))
+    print("-"*46)
     pre = overall_tp/(overall_tp+overall_fp) if overall_fp else nan
     rec = overall_tp/(overall_tp+overall_fn) if overall_fn else nan
     f1 = (2.*pre*rec)/(pre+rec) if (pre + rec) else nan
-    print "{:<16} {:<9} {:<9} {:<9}".format("Overall", round(pre,3)*100, round(rec,3)*100, round(f1,3)*100)
-    print "Err: %s%%" % round((100.0 - float(total_correct) / float(counter-1) * 100.0), 2)
-    print "SER: %s%%" % round((substitutions + deletions + insertions) / (correct + substitutions + deletions) * 100, 1)
+    print("{:<16} {:<9} {:<9} {:<9}".format("Overall", round(pre,3)*100, round(rec,3)*100, round(f1,3)*100))
+    print("Err: %s%%" % round((100.0 - float(total_correct) / float(counter-1) * 100.0), 2))
+    print("SER: %s%%" % round((substitutions + deletions + insertions) / (correct + substitutions + deletions) * 100, 1))
 
+def main(options):
 
-if __name__ == "__main__":
-
-    if len(sys.argv) > 1:
-        target_path = sys.argv[1]
+    if options.groundtruth_path:
+        target_path = options.groundtruth_path
     else:
         sys.exit("Ground truth file path argument missing")
 
-    if len(sys.argv) > 2:
-        predicted_path = sys.argv[2]
+    if options.predictions_path:
+        predicted_path = options.predictions_path
     else:
         sys.exit("Model predictions file path argument missing")
 
-    compute_error([target_path], [predicted_path])    
-        
+    if os.path.isdir(target_path) and os.path.isdir(predicted_path):
+        target_paths = [os.path.join(target_path, f) for f in os.listdir(target_path)]
+        target_paths.sort()
+        predicted_paths = [os.path.join(predicted_path, f) for f in os.listdir(predicted_path)]
+        predicted_paths.sort()
+    else:
+        target_paths = [target_path]
+        predicted_paths = [predicted_path]
+
+    compute_error(target_paths, predicted_paths, options.reduced_punctuation) 
+
+if __name__ == "__main__": 
+	usage = "usage: %prog [-s infile] [option]"
+	parser = OptionParser(usage=usage)
+	parser.add_option("-g", "--groundtruth", dest="groundtruth_path", default=None, help="Groundtruth file or directory", type="string")
+	parser.add_option("-p", "--predictions", dest="predictions_path", default=None, help="Predicted file or directory", type="string")
+	parser.add_option("-r", "--reduced_punctuation", dest="reduced_punctuation", default=True, help="Use reduced punctuation vocabulary", action="store_true")
+
+	(options, args) = parser.parse_args()
+	main(options)
+
+    
