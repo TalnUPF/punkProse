@@ -1,3 +1,5 @@
+(note: this repository is a copy of https://github.com/alpoktem/punkProse. Please check there for the latest versions.)
+
 # punkProse
 
 Punctuation generation for speech transcripts using lexical, syntactic and prosodic features. 
